@@ -2,99 +2,74 @@
 Manim Render Service
 ====================
 Receives Manim Python code + a scene class name, renders it to MP4 via
-`manim render`, uploads the result to Vercel Blob, and returns the URL.
+`manim render`, and returns the raw video bytes.
 
-Environment variables required:
-  BLOB_READ_WRITE_TOKEN  – Vercel Blob token (same one used by the Next.js app)
-  RENDER_API_KEY         – Optional shared secret; clients send it as
-                           X-Api-Key header. Leave empty to disable auth.
+The caller (Next.js API route) is responsible for uploading to Vercel Blob.
+This keeps BLOB_READ_WRITE_TOKEN out of the Railway environment entirely.
+
+Environment variables:
+  RENDER_API_KEY  – Optional shared secret sent as X-Api-Key header.
+                    Leave empty to disable auth.
 """
 
+import base64
 import os
 import re
 import shutil
 import subprocess
 import tempfile
-import uuid
 from pathlib import Path
 
-import httpx
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-BLOB_TOKEN: str = os.environ.get("BLOB_READ_WRITE_TOKEN", "")
 API_KEY: str = os.environ.get("RENDER_API_KEY", "")  # empty = no auth
 
 QUALITY_FLAGS = {
     "low": "-ql",       # 480p 15fps  – fastest, good for previews
-    "medium": "-qm",    # 720p 30fps  – balanced (default)
+    "medium": "-qm",    # 720p 30fps  – balanced
     "high": "-qh",      # 1080p 60fps – slowest
-    "preview": "-qp",   # 480p 15fps with preview window (headless-safe alias)
+    "preview": "-qp",   # 480p 15fps
 }
 
 # ── Models ────────────────────────────────────────────────────────────────────
 
 class RenderRequest(BaseModel):
     code: str = Field(..., description="Full Manim Python source code")
-    scene: str = Field(..., description="Class name of the Scene to render, e.g. 'LinearTransformScene'")
-    topic_slug: str = Field("unknown", description="Topic slug used as Blob path prefix")
-    quality: str = Field("medium", description="Render quality: low | medium | high")
-
-
-class RenderResponse(BaseModel):
-    videoUrl: str
-    duration: str
-    code: str
-
-
-class ErrorDetail(BaseModel):
-    detail: str
-    stderr: str | None = None
+    scene: str = Field(..., description="Scene class name to render")
+    topic_slug: str = Field("unknown", description="Used as filename prefix")
+    quality: str = Field("low", description="Render quality: low | medium | high")
 
 
 # ── Code sanitizer ────────────────────────────────────────────────────────────
 
 def sanitize_manim_code(code: str) -> str:
     """
-    Strip LaTeX-dependent Manim classes so the render doesn't fail on
-    systems without a working TeX installation.
-
-    Replacements performed (in order):
-      1. MathTex(  →  Text(      (MathTex always needs LaTeX)
-      2. Tex(      →  Text(      (bare Tex also needs LaTeX)
-         – but NOT Text( itself (avoid double-replacing)
-      3. r"..."    →  "..."      (raw strings used for LaTeX markup become plain)
-      4. r'...'    →  '...'
-
-    These are best-effort transformations.  The resulting code may look a bit
-    different visually, but it will render without crashing.
+    Replace LaTeX-dependent Manim classes (MathTex, Tex) with Text()
+    so renders work without a TeX installation.
     """
-    # 1. MathTex → Text
+    # MathTex → Text
     code = re.sub(r'\bMathTex\s*\(', 'Text(', code)
-
-    # 2. Tex( → Text(  (word-boundary so we don't hit "Context", "Latex", etc.)
-    #    Use negative look-ahead to skip already-replaced Text(
+    # Tex( → Text(  (word boundary avoids hitting Context, Latex, etc.)
     code = re.sub(r'\bTex\s*\(', 'Text(', code)
 
-    # 3. Strip raw-string prefix from string literals  r"..." → "..."
-    code = re.sub(r'\br(""")', r'\1', code)   # triple-quote raw strings
+    # Strip raw-string prefix: r"..." → "..."  r'...' → '...'
+    code = re.sub(r'\br(""")', r'\1', code)
     code = re.sub(r"\br(''')", r'\1', code)
-    code = re.sub(r'\br(")', r'\1', code)     # single-quote raw strings
+    code = re.sub(r'\br(")', r'\1', code)
     code = re.sub(r"\br(')", r'\1', code)
 
-    # 4. Remove any remaining LaTeX-style backslash sequences inside strings
-    #    that would confuse Python's string parser, e.g. \frac → frac
-    #    (only inside double-quoted string content — approximate)
+    # Remove LaTeX backslash sequences inside double-quoted strings
     def strip_latex_bs(m: re.Match) -> str:
         inner = m.group(1)
-        inner = re.sub(r'\\([a-zA-Z]+)', r'\1 ', inner)  # \frac → frac
-        inner = re.sub(r'[{}^_]', '', inner)             # remove {, }, ^, _
+        inner = re.sub(r'\\([a-zA-Z]+)', r'\1 ', inner)   # \frac → frac
+        inner = re.sub(r'[{}^_]', '', inner)               # remove {, }, ^, _
         return f'"{inner}"'
 
     code = re.sub(r'"((?:[^"\\]|\\.)*)"', strip_latex_bs, code)
-
     return code
 
 
@@ -102,8 +77,8 @@ def sanitize_manim_code(code: str) -> str:
 
 app = FastAPI(
     title="Manim Render Service",
-    description="Renders Manim animations to MP4 and stores them in Vercel Blob.",
-    version="1.0.0",
+    description="Renders Manim animations to MP4 and returns raw binary.",
+    version="2.0.0",
 )
 
 
@@ -113,24 +88,20 @@ def health() -> dict:
     return {"status": "ok", "service": "manim-render"}
 
 
-@app.post("/render", response_model=RenderResponse)
+@app.post("/render")
 async def render(
     req: RenderRequest,
     x_api_key: str = Header(default=""),
-) -> RenderResponse:
+) -> Response:
     """
-    Render a Manim scene to MP4 and return a Vercel Blob URL.
+    Render a Manim scene and return the raw MP4 bytes.
 
-    Steps:
-      1. Validate auth (if RENDER_API_KEY is set)
-      2. Write code to a temp file
-      3. Run `manim render scene.py <SceneName> -q<quality>`
-      4. Find the MP4 output
-      5. Upload to Vercel Blob
-      6. Clean up temp files
-      7. Return { videoUrl, duration, code }
+    Response headers:
+      Content-Type: video/mp4
+      X-Duration:   human-readable duration string (e.g. "12.3s")
+      X-Code:       base64-encoded sanitized source code
     """
-    # ── 1. Auth ──────────────────────────────────────────────────────────────
+    # ── Auth ──────────────────────────────────────────────────────────────────
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key")
 
@@ -144,56 +115,49 @@ async def render(
             detail=f"`quality` must be one of: {', '.join(QUALITY_FLAGS)}",
         )
 
-    # ── 2. Temp workspace ────────────────────────────────────────────────────
     work_dir = Path(tempfile.mkdtemp(prefix="manim-"))
     scene_file = work_dir / "scene.py"
     media_dir = work_dir / "media"
 
     try:
-        # Sanitize code to remove LaTeX-dependent classes (MathTex, Tex)
+        # Sanitize → write
         sanitized_code = sanitize_manim_code(req.code)
         scene_file.write_text(sanitized_code, encoding="utf-8")
 
-        # ── 3. Render ─────────────────────────────────────────────────────────
-        quality_flag = QUALITY_FLAGS[req.quality]
+        # Render
         cmd = [
             "manim", "render",
             str(scene_file),
             req.scene,
-            quality_flag,
+            QUALITY_FLAGS[req.quality],
             "--format", "mp4",
             "--media_dir", str(media_dir),
             "--disable_caching",
         ]
-
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=120,  # 2-minute hard cap per render
+            timeout=120,
             cwd=str(work_dir),
         )
-
         if result.returncode != 0:
-            # Return the last 3 000 chars of stderr for debugging
             stderr_tail = result.stderr[-3_000:] if result.stderr else "(no stderr)"
             raise HTTPException(
                 status_code=500,
                 detail=f"Manim render failed (exit {result.returncode}): {stderr_tail}",
             )
 
-        # ── 4. Find MP4 ───────────────────────────────────────────────────────
+        # Find MP4
         mp4_files = sorted(media_dir.rglob("*.mp4"))
         if not mp4_files:
             raise HTTPException(
                 status_code=500,
-                detail="Render succeeded but no MP4 file was produced. Check scene name.",
+                detail="Render succeeded but no MP4 was produced — check scene name.",
             )
+        mp4_bytes = mp4_files[0].read_bytes()
 
-        mp4_path = mp4_files[0]
-        mp4_bytes = mp4_path.read_bytes()
-
-        # ── 4b. Get duration via ffprobe ──────────────────────────────────────
+        # Duration via ffprobe
         duration = "unknown"
         try:
             probe = subprocess.run(
@@ -201,55 +165,26 @@ async def render(
                     "ffprobe", "-v", "error",
                     "-show_entries", "format=duration",
                     "-of", "default=noprint_wrappers=1:nokey=1",
-                    str(mp4_path),
+                    str(mp4_files[0]),
                 ],
-                capture_output=True,
-                text=True,
-                timeout=10,
+                capture_output=True, text=True, timeout=10,
             )
             secs = float(probe.stdout.strip())
             minutes = int(secs // 60)
             remaining = secs % 60
             duration = f"{minutes}:{remaining:04.1f}" if minutes else f"{secs:.1f}s"
         except Exception:
-            pass  # duration remains "unknown"
+            pass
 
-        # ── 5. Upload to Vercel Blob ──────────────────────────────────────────
-        if not BLOB_TOKEN:
-            raise HTTPException(
-                status_code=500,
-                detail="BLOB_READ_WRITE_TOKEN is not configured on the server.",
-            )
-
-        blob_path = f"manim/{req.topic_slug}/{uuid.uuid4()}.mp4"
-
-        async with httpx.AsyncClient() as client:
-            resp = await client.put(
-                f"https://blob.vercel-storage.com/{blob_path}",
-                content=mp4_bytes,
-                headers={
-                    "Authorization": f"Bearer {BLOB_TOKEN}",
-                    "x-content-type": "video/mp4",
-                    "x-vercel-blob-content-type": "video/mp4",
-                },
-                timeout=90.0,
-            )
-
-        if resp.status_code not in (200, 201):
-            raise HTTPException(
-                status_code=502,
-                detail=f"Vercel Blob upload failed ({resp.status_code}): {resp.text[:500]}",
-            )
-
-        video_url: str = resp.json().get("url", "")
-        if not video_url:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Vercel Blob returned no URL. Response: {resp.text[:500]}",
-            )
-
-        return RenderResponse(videoUrl=video_url, duration=duration, code=req.code)
+        # Return raw bytes — caller uploads to Blob
+        return Response(
+            content=mp4_bytes,
+            media_type="video/mp4",
+            headers={
+                "X-Duration": duration,
+                "X-Code": base64.b64encode(sanitized_code.encode()).decode(),
+            },
+        )
 
     finally:
-        # ── 6. Cleanup ────────────────────────────────────────────────────────
         shutil.rmtree(work_dir, ignore_errors=True)
