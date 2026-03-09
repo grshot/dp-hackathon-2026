@@ -1,7 +1,7 @@
 # ── Manim Render Service ──
-# Extends the official ManimCommunity image which already has:
-#   Python 3, Manim + all Python deps, LaTeX, Cairo, ffmpeg, ffprobe
-FROM ghcr.io/manimcommunity/manim:stable
+# Uses the ManimCommunity image from Docker Hub (public, no auth required).
+# Pre-installed: Python 3, Manim, LaTeX, Cairo, ffmpeg, ffprobe.
+FROM manimcommunity/manim:stable
 
 WORKDIR /app
 
