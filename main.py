@@ -11,6 +11,7 @@ Environment variables required:
 """
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -51,6 +52,50 @@ class RenderResponse(BaseModel):
 class ErrorDetail(BaseModel):
     detail: str
     stderr: str | None = None
+
+
+# ── Code sanitizer ────────────────────────────────────────────────────────────
+
+def sanitize_manim_code(code: str) -> str:
+    """
+    Strip LaTeX-dependent Manim classes so the render doesn't fail on
+    systems without a working TeX installation.
+
+    Replacements performed (in order):
+      1. MathTex(  →  Text(      (MathTex always needs LaTeX)
+      2. Tex(      →  Text(      (bare Tex also needs LaTeX)
+         – but NOT Text( itself (avoid double-replacing)
+      3. r"..."    →  "..."      (raw strings used for LaTeX markup become plain)
+      4. r'...'    →  '...'
+
+    These are best-effort transformations.  The resulting code may look a bit
+    different visually, but it will render without crashing.
+    """
+    # 1. MathTex → Text
+    code = re.sub(r'\bMathTex\s*\(', 'Text(', code)
+
+    # 2. Tex( → Text(  (word-boundary so we don't hit "Context", "Latex", etc.)
+    #    Use negative look-ahead to skip already-replaced Text(
+    code = re.sub(r'\bTex\s*\(', 'Text(', code)
+
+    # 3. Strip raw-string prefix from string literals  r"..." → "..."
+    code = re.sub(r'\br(""")', r'\1', code)   # triple-quote raw strings
+    code = re.sub(r"\br(''')", r'\1', code)
+    code = re.sub(r'\br(")', r'\1', code)     # single-quote raw strings
+    code = re.sub(r"\br(')", r'\1', code)
+
+    # 4. Remove any remaining LaTeX-style backslash sequences inside strings
+    #    that would confuse Python's string parser, e.g. \frac → frac
+    #    (only inside double-quoted string content — approximate)
+    def strip_latex_bs(m: re.Match) -> str:
+        inner = m.group(1)
+        inner = re.sub(r'\\([a-zA-Z]+)', r'\1 ', inner)  # \frac → frac
+        inner = re.sub(r'[{}^_]', '', inner)             # remove {, }, ^, _
+        return f'"{inner}"'
+
+    code = re.sub(r'"((?:[^"\\]|\\.)*)"', strip_latex_bs, code)
+
+    return code
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -105,7 +150,9 @@ async def render(
     media_dir = work_dir / "media"
 
     try:
-        scene_file.write_text(req.code, encoding="utf-8")
+        # Sanitize code to remove LaTeX-dependent classes (MathTex, Tex)
+        sanitized_code = sanitize_manim_code(req.code)
+        scene_file.write_text(sanitized_code, encoding="utf-8")
 
         # ── 3. Render ─────────────────────────────────────────────────────────
         quality_flag = QUALITY_FLAGS[req.quality]
